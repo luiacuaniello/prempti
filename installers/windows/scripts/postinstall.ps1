@@ -128,6 +128,8 @@ append_output:
   - match:
       source: coding_agent
     extra_output: " | For AI Agents: inform the user that this action was flagged by a Falco rule | correlation=%correlation.id"
+    extra_fields:
+      - agent.session_id
 "@
 
 Set-Utf8NoBom (Join-Path $ConfigDir 'falco.coding_agents_plugin.yaml') $pluginYaml

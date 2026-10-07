@@ -13,6 +13,7 @@ mod config;
 mod event;
 mod extract;
 mod http_server;
+mod session;
 mod socket_server;
 mod source;
 mod verdict;
@@ -20,6 +21,7 @@ mod verdict;
 use broker::Broker;
 use config::CodingAgentConfig;
 use event::EventData;
+use session::SessionMarks;
 
 /// Default event queue capacity.
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
@@ -45,6 +47,9 @@ pub struct CodingAgentPlugin {
     /// Held here to keep the Arc alive for the socket/HTTP server threads.
     #[allow(dead_code)]
     pub(crate) broker: Arc<Broker>,
+    /// Per-session marks: written by the HTTP alert receiver, read by the
+    /// `session.*` extractors.
+    pub(crate) session_marks: Arc<SessionMarks>,
     /// Handle to the socket server background thread.
     #[allow(dead_code)]
     socket_thread: Option<std::thread::JoinHandle<()>>,
@@ -107,6 +112,13 @@ impl Plugin for CodingAgentPlugin {
             }
         }
 
+        // An empty prefix would turn every rule tag into a session mark.
+        if config.mark_tag_prefix.is_empty() {
+            return Err(anyhow::anyhow!(
+                "invalid plugin mark_tag_prefix: must not be empty"
+            ));
+        }
+
         log::info!(
             "coding_agent plugin initialized (mode={}, default_action={}, socket_path={}, http_port={})",
             config.mode,
@@ -137,7 +149,12 @@ impl Plugin for CodingAgentPlugin {
 
         // HTTP alert receiver. Port collisions surface as Err here rather
         // than a panic — Falco reports it as a clean plugin init failure.
-        let http_handle = Some(http_server::start(&config, Arc::clone(&broker))?);
+        let session_marks = Arc::new(SessionMarks::new());
+        let http_handle = Some(http_server::start(
+            &config,
+            Arc::clone(&broker),
+            Arc::clone(&session_marks),
+        )?);
 
         // Pending request reaper (TTL cleanup). Thread-spawn failure here is
         // fatal — but it effectively never happens and the panic is isolated
@@ -148,6 +165,7 @@ impl Plugin for CodingAgentPlugin {
             config,
             event_rx,
             broker,
+            session_marks,
             socket_thread,
             http_handle,
             reaper_thread,

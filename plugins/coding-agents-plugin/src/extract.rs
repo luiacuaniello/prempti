@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 
 use anyhow::Error;
 use falco_plugin::event::events::Event;
@@ -154,6 +154,36 @@ impl CodingAgentPlugin {
         let val = req.context.patch_op(payload).unwrap_or("");
         Ok(CString::new(val)?)
     }
+
+    /// Milliseconds since `label` was last marked in this event's session by
+    /// an earlier tool call. No value when it never was, so comparisons such
+    /// as `< 300000` are false for sessions without the mark.
+    fn extract_session_mark_age_ms(
+        &mut self,
+        mut req: ExtractRequest<Self>,
+        label: &CStr,
+    ) -> Result<Option<u64>, Error> {
+        let payload = self.get_payload(&mut req)?;
+        let correlation_id = req.context.correlation_id(payload).unwrap_or(0);
+        let session_id = req.context.session_id(payload).unwrap_or("");
+        let age = self
+            .session_marks
+            .age(session_id, label.to_str()?, correlation_id);
+        Ok(age.map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)))
+    }
+
+    fn extract_session_mark_count(
+        &mut self,
+        mut req: ExtractRequest<Self>,
+        label: &CStr,
+    ) -> Result<u64, Error> {
+        let payload = self.get_payload(&mut req)?;
+        let correlation_id = req.context.correlation_id(payload).unwrap_or(0);
+        let session_id = req.context.session_id(payload).unwrap_or("");
+        Ok(self
+            .session_marks
+            .count(session_id, label.to_str()?, correlation_id))
+    }
 }
 
 impl ExtractPlugin for CodingAgentPlugin {
@@ -226,5 +256,11 @@ impl ExtractPlugin for CodingAgentPlugin {
         field("tool.patch_op", &Self::extract_patch_op)
             .with_display("Patch Operation")
             .with_description("Per-event operation for codex apply_patch synthetic events: Add | Update | Delete | Move (empty for all other events)"),
+        field("session.mark_age_ms", &Self::extract_session_mark_age_ms)
+            .with_display("Session Mark Age (ms)")
+            .with_description("Milliseconds since the given label was last marked in this session by an earlier tool call, through a rule tagged with the mark prefix (e.g. session.mark_age_ms[credential_access]); no value if never marked"),
+        field("session.mark_count", &Self::extract_session_mark_count)
+            .with_display("Session Mark Count")
+            .with_description("Number of earlier tool calls in this session that marked the given label through a rule tagged with the mark prefix (e.g. session.mark_count[credential_access]); 0 if never marked"),
     ];
 }

@@ -57,3 +57,7 @@ append_output:
   - match:
       source: coding_agent
     extra_output: "| For AI Agents: inform the user that this action was flagged by a Falco rule | correlation=%correlation.id"
+    # Structured only (not part of the message): lets the broker attribute
+    # session marks (rules tagged `coding_agent_mark:<label>`) to a session.
+    extra_fields:
+      - agent.session_id

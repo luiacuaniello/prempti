@@ -53,6 +53,14 @@ pub struct CodingAgentConfig {
     #[serde(default = "default_seen_tags")]
     pub seen_tags: Vec<String>,
 
+    /// Tag prefix that records a session mark. A rule tagged
+    /// `<prefix><label>` records `<label>` in the session of the event it
+    /// matched, queryable by later events of the same session through
+    /// `session.mark_age_ms[<label>]` and `session.mark_count[<label>]`.
+    /// Must not be empty.
+    #[serde(default = "default_mark_tag_prefix")]
+    pub mark_tag_prefix: String,
+
     /// Maximum size in bytes of a single wire request the broker will read
     /// from an interceptor connection. Default 5 MiB (5 * 1024 * 1024).
     /// Raise this if you see deny responses with reason `"read error"` and
@@ -105,6 +113,10 @@ fn default_ask_tags() -> Vec<String> {
 
 fn default_seen_tags() -> Vec<String> {
     vec!["coding_agent_seen".to_string()]
+}
+
+fn default_mark_tag_prefix() -> String {
+    "coding_agent_mark:".to_string()
 }
 
 fn default_max_request_bytes() -> u64 {
