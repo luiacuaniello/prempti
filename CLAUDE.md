@@ -80,7 +80,7 @@ The plugin requires two capabilities: **sourcing** (event generation) and **extr
 
 ### Single data source, generic event fields
 
-One Falco data source: **`coding_agent`**. Two field namespaces:
+One Falco data source: **`coding_agent`**. Field namespaces:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -105,6 +105,8 @@ One Falco data source: **`coding_agent`**. Two field namespaces:
 | `agent.transcript_path` | string | Session transcript file path. Empty when the agent reports `null`. |
 | `agent.model` | string | Model identifier reported by the agent (Codex-only; empty for Claude Code) |
 | `agent.turn_id` | string | Turn identifier within a session (Codex-only; finer than `session_id`; empty for Claude Code) |
+| `session.mark_age_ms[<label>]` | u64 | Milliseconds since `<label>` was last marked by an earlier tool call of this event's session (see "Session marks"). No value if never marked, so comparisons are false. |
+| `session.mark_count[<label>]` | u64 | Number of earlier tool calls of this event's session that marked `<label>`. `0` if never marked. |
 
 This schema is agent-agnostic. The `agent.name` field distinguishes which coding agent generated the event.
 
@@ -125,6 +127,19 @@ Malformed apply_patch envelopes fail closed: the broker writes a deny response w
 - When comparing one field against another in Falco rule conditions, use the `val()` transformer. For path containment, compare equality with `agent.real_cwd` or use `tool.real_file_path startswith val(agent.real_cwd_prefix)`; the trailing slash prevents sibling-prefix collisions. Without `val()`, the RHS is treated as a literal string, not a field reference.
 - For name-based policies, match both the access name and canonical target name: `tool.file_name = ".env" or basename(tool.real_file_path) = ".env"`. The first catches a sensitive symlink alias; the second catches an innocuous alias that resolves to a sensitive target. `tool.file_name` is platform-aware, and `tool.real_file_path` uses forward slashes on every platform.
 - For rules that care about the destructive operation type (e.g. gating only deletes), pattern-match on `tool.patch_op` directly: `tool.patch_op = "Delete" and tool.real_file_path startswith "/etc/"`. Otherwise prefer `is_write_tool` which covers all four ops uniformly.
+
+### Session marks: stateful sequence detection
+
+Rules evaluate one event at a time, but many risky behaviors are sequences of individually harmless tool calls (e.g. a credential read followed by a web request). Session marks let plain Falco rules express them without new rule syntax:
+
+- A rule tagged `coding_agent_mark:<label>` (prefix configurable via `mark_tag_prefix`) records `<label>` in the session of the event it matched. Such a rule needs no deny/ask tag; mark tags never change verdict classification.
+- Later events of the same session (`agent.session_id`) query it through `session.mark_age_ms[<label>]` and `session.mark_count[<label>]`, e.g. `tool.name = "WebFetch" and session.mark_age_ms[credential_access] < 300000`.
+
+The HTTP alert receiver records marks before applying the verdict of the same alert, attributing them to the session via `agent.session_id`, which `append_output.extra_fields` adds to every alert's `output_fields` (it is not part of the message). Because the seen rule is loaded last, a mark set by tool call N is in place before N's verdict is released, so sequential tool calls observe it.
+
+A mark alert can land while Falco is still evaluating later rules (conditions and outputs) of the same event, so each mark remembers the `correlation.id` of the tool call that set it, and that tool call is served the state from before its own mark. A rule therefore never observes a mark set by its own tool call, whatever the alert timing, and `session.mark_count` counts tool calls, not rule matches (several rules, or several Codex `apply_patch` events, of one tool call count once). State lives in `session.rs`: in-memory only, bounded (least recently active sessions and least recently set labels are evicted), and lost on restart. Marks are recorded for every matching event regardless of the final verdict.
+
+Known gaps: parallel tool calls in one session may be evaluated before each other's marks land; `passthrough` mode releases verdicts before evaluation; and like verdict alerts, a local process that can post to the loopback receiver can forge marks. Use marks to escalate verdicts, never to exempt events from other rules.
 
 ### Rule output convention
 
