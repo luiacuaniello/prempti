@@ -147,6 +147,8 @@ Implements `ExtractPlugin` with per-event caching via `ExtractContext`.
 | `tool.file_name` | string | Platform-aware final component of `tool.file_path` before symlink resolution. Name-based policies combine this with the canonical basename. |
 | `tool.real_file_path` | string | Resolved absolute path. Existing ancestors are canonicalized before a missing suffix is appended, so symlinked parents are preserved for new files. Populated whenever `tool.file_path` is. |
 | `tool.patch_op` | string | Per-event operation for Codex `apply_patch` synthetic events: `Add`, `Update`, `Delete`, or `Move`. Empty for all other events. |
+| `session.mark_age_ms[<label>]` | u64 | Milliseconds since `<label>` was last marked by an earlier tool call of the session named by `event.session_id`. No value if never marked. See "Session Marks". |
+| `session.mark_count[<label>]` | u64 | Number of earlier tool calls of the session named by `event.session_id` that marked `<label>`. `0` if never marked. |
 
 Event source restriction: `CodingAgentPayload` with `EventSource::SOURCE = Some("coding_agent")` prevents extraction from syscall events.
 
@@ -158,6 +160,7 @@ Background thread spawned in `Plugin::new()`. Receives Falco JSON alerts via `ht
 - **Library**: `tiny_http` (synchronous, minimal)
 - **Response**: 200 OK immediately (must be fast — blocks Falco's output worker)
 - **Body limit**: 1 MB
+- **Session marks**: Before classifying the verdict, tags starting with `mark_tag_prefix` are recorded as marks in the session named by `output_fields.agent.session_id` (see "Session Marks").
 - **Alert parsing**: Extract `correlation.id` from `output_fields` (u64), classify tags. Only a live ID can affect a pending request; unknown IDs are ignored. Randomness mitigates blind guessing but does not authenticate the alert.
 
 ### Broker (`broker.rs`)
@@ -170,6 +173,17 @@ Tracks pending requests and resolves verdicts. Shared via `Arc<Broker>` across a
 - **`expected_events` counter**: `AtomicU64` per pending request, set at register time. `1` for ordinary single-event flows (every hook except Codex `apply_patch`), `N` for the multi-file `apply_patch` multiplex. `apply_seen` decrements; the broker only resolves on the last seen (the call that brings the counter to 0). `apply_deny` short-circuits regardless of remaining seens.
 - **Mode flags**: `monitor_mode` and `passthrough` `AtomicBool`s, set from plugin config on init
 - **No-match floor**: `default_action` (`allow` | `defer`) stored as an `AtomicBool`, set from plugin config; consulted only on the guardrails no-deny/ask resolution path
+
+### Session Marks (`session.rs`)
+
+Per-session state that lets rules correlate events over time. A rule tagged `<mark_tag_prefix><label>` (default `coding_agent_mark:<label>`) records `<label>` in the session of the matched event; the `session.mark_age_ms[<label>]` and `session.mark_count[<label>]` extract fields expose it to later events of the same session.
+
+- **Write path**: the HTTP alert receiver, before applying any verdict from the same alert. The session comes from `output_fields.agent.session_id`, added to every coding_agent alert by `append_output.extra_fields`; mark alerts without it are skipped with a one-time warning.
+- **Read path**: the extractor, keyed by the event's `session_id`.
+- **Ordering**: the seen rule is loaded last, so a mark set by tool call N is recorded before N's verdict is released and is visible to the session's next tool call.
+- **Own tool call**: a mark alert can land while Falco is still evaluating later rules (conditions and outputs) of the same event. Each mark therefore stores the `correlation.id` of the tool call that set it, and that tool call is served the state from before its own mark, so results never depend on alert timing. `session.mark_count` counts tool calls: several rules, or several Codex `apply_patch` events, of one tool call count once.
+- **Bounds**: at most 1024 sessions (least recently active evicted) and 64 labels per session (least recently set evicted). In-memory only; lost on restart.
+- **Verdicts**: marks are recorded for every matching event, including events that end up denied. Mark tags never affect verdict classification.
 
 ### Verdict Resolution
 
@@ -221,6 +235,7 @@ init_config:
   deny_tags: [coding_agent_deny]
   ask_tags: [coding_agent_ask]
   seen_tags: [coding_agent_seen]
+  mark_tag_prefix: "coding_agent_mark:"   # must not be empty
 ```
 
 All fields have defaults (`mode: guardrails`, `default_action: allow`). Both are validated at plugin init — an unrecognized value is a clean init error, not a silent fallback. `${HOME}` is expanded by Falco before reaching the plugin. Change them via `premptictl mode <…>` / `premptictl default-action <allow|defer>` (which rewrite the fragment and restart the service), or edit the fragment directly and `premptictl restart`.
@@ -265,3 +280,4 @@ Since every broker-assigned `correlation.id` is non-zero, this condition is alwa
 5. **Wire request size cap.** The socket server's read cap is `max_request_bytes` (default 5 MiB, configurable in plugin `init_config`, clamped to `[4 KiB, 64 MiB]`). The interceptor's matching `PREMPTI_INPUT_MAX_BYTES` (default 4 MiB) bounds what reaches the broker in the first place; envelope overhead is the gap. Raise both knobs in tandem to support very large `apply_patch` payloads.
 6. **Codex `permission_mode = "dontAsk"` × `PermissionRequest` interaction is unverified at runtime**: the multi-event multiplex and the verdict mapping (`ask → deny + reason` on both mounts) handle this safely on paper, but exact firing semantics of `PermissionRequest` under `dontAsk` are still inferred from upstream source, not observed.
 7. **Loopback HTTP alerts are unauthenticated**: the receiver trusts a correctly shaped alert carrying a live `correlation.id`. Random nonces make blind guessing impractical, but a local process that learns a live ID can submit a matching deny/ask/seen alert. This is an explicit threat-model boundary, not transport authentication.
+8. **Session marks are best-effort ordering**: parallel tool calls in one session may be evaluated before each other's marks are recorded, and `passthrough` mode releases verdicts before rule evaluation. A local process that can post to the loopback receiver can also forge marks, so rules should use marks to escalate verdicts, never to exempt events from other rules.

@@ -43,6 +43,7 @@ Rules use tags to communicate verdicts to the plugin broker:
 | `coding_agent_deny` | Block the tool call |
 | `coding_agent_ask` | Require user confirmation |
 | `coding_agent_seen` | Signal evaluation complete (used only by `seen.yaml`) |
+| `coding_agent_mark:<label>` | Record `<label>` in the event's session; no verdict on its own (see [Session marks](#session-marks)) |
 
 When multiple rules match the same event, verdict escalation applies: **deny > ask > {allow | defer}**. The lowest tier is the no-rule-match floor set by the plugin's `default_action` (`allow` by default, or `defer` to hand the decision to the agent's own permission system); a single instance uses one floor uniformly.
 
@@ -114,6 +115,37 @@ A custom user rule that asks for confirmation before the agent edits a dependenc
   source: coding_agent
   tags: [coding_agent_ask]
 ```
+
+### Session marks
+
+Each rule sees a single event, but some behaviors only become suspicious as a sequence — reading a project's `.env` and then sending a web request, for instance. Reading `.env` is normal on its own, so no single-event rule can flag the pair without flagging every read. A rule tagged `coding_agent_mark:<label>` records `<label>` in the session of the event it matched; later events of the same session can query it:
+
+| Field | Value |
+|-------|-------|
+| `session.mark_age_ms[<label>]` | Milliseconds since `<label>` was last marked by an earlier tool call of this session; no value (comparisons are false) if never marked |
+| `session.mark_count[<label>]` | Number of earlier tool calls of this session that marked `<label>`; `0` if never marked |
+
+```yaml
+- rule: Mark secrets file read
+  desc: Record that the session read a .env file. Reading it is common and allowed; only what follows may be suspicious.
+  condition: tool.name = "Read" and (tool.file_name = ".env" or basename(tool.real_file_path) = ".env")
+  output: Falco noted that this session read secrets at %tool.real_file_path
+  priority: INFORMATIONAL
+  source: coding_agent
+  tags: [coding_agent_mark:secrets_read]
+
+- rule: Ask before web requests after reading secrets
+  desc: Require confirmation for web requests within 5 minutes of a .env read in the same session.
+  condition: tool.name = "WebFetch" and session.mark_age_ms[secrets_read] < 300000
+  output: >
+    Falco requires confirmation for this web request because this session read
+    secrets %session.mark_age_ms[secrets_read] ms ago
+  priority: WARNING
+  source: coding_agent
+  tags: [coding_agent_ask]
+```
+
+A mark is visible to the session's *later* tool calls, never to the tool call that set it, and a tool call counts once per label however many of its rules mark it. Marks are kept in memory only and reset when the service restarts. Use marks to escalate verdicts (ask, deny), never to exempt events from other rules: like verdict alerts, marks arrive over the unauthenticated loopback receiver.
 
 ### Tips
 
