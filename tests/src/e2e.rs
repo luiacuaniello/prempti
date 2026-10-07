@@ -8,6 +8,16 @@ use crate::interceptor::{self, AgentKind};
 
 static NEXT_HARNESS_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Which rules a harness loads ahead of the catch-all seen rule.
+enum RulesSource<'a> {
+    /// The compact generated fixture from `write_rules`.
+    Fixture,
+    /// The repository's shipped default ruleset and seen rule.
+    Shipped,
+    /// Test-provided rules YAML, followed by the fixture's seen rule.
+    Custom(&'a str),
+}
+
 /// E2E test harness managing a Falco process with the coding-agent plugin.
 pub struct E2eHarness {
     falco: Child,
@@ -106,7 +116,7 @@ impl E2eHarness {
     /// guardrails mode only; monitor/passthrough always resolve as defer.
     /// Returns `None` if Falco or the plugin is not available.
     pub fn start_with_default_action(mode: &str, default_action: &str) -> Option<Self> {
-        Self::start_internal(mode, default_action, false)
+        Self::start_internal(mode, default_action, RulesSource::Fixture)
     }
 
     /// Start Falco with the repository's shipped default and seen rules.
@@ -114,10 +124,17 @@ impl E2eHarness {
     /// security regressions in production macros must be exercised against
     /// the exact YAML that users install.
     pub fn start_with_shipped_rules(mode: &str) -> Option<Self> {
-        Self::start_internal(mode, "allow", true)
+        Self::start_internal(mode, "allow", RulesSource::Shipped)
     }
 
-    fn start_internal(mode: &str, default_action: &str, shipped_rules: bool) -> Option<Self> {
+    /// Start Falco with test-provided rules (YAML) loaded ahead of the
+    /// catch-all seen rule, instead of the generated fixture. Use for
+    /// features whose rules would interfere with the shared fixture.
+    pub fn start_with_rules(mode: &str, rules_yaml: &str) -> Option<Self> {
+        Self::start_internal(mode, "allow", RulesSource::Custom(rules_yaml))
+    }
+
+    fn start_internal(mode: &str, default_action: &str, rules: RulesSource) -> Option<Self> {
         let falco_bin = find_falco()?;
         let plugin_lib = find_plugin_lib()?;
         // Skip only if NO interceptor is built. Per-test binary requirements
@@ -147,14 +164,23 @@ impl E2eHarness {
             .map(|addr| addr.port())
             .unwrap_or(19000 + ((pid as u64 + harness_id) % 1000) as u16);
 
-        let rules_files = if shipped_rules {
-            vec![
+        let rules_files = match rules {
+            RulesSource::Shipped => vec![
                 root.join("rules/default/coding_agents_rules.yaml"),
                 root.join("rules/seen.yaml"),
-            ]
-        } else {
-            write_rules(&rules_dir);
-            vec![rules_dir.join("deny.yaml"), rules_dir.join("seen.yaml")]
+            ],
+            RulesSource::Fixture => {
+                write_rules(&rules_dir);
+                vec![rules_dir.join("deny.yaml"), rules_dir.join("seen.yaml")]
+            }
+            RulesSource::Custom(rules_yaml) => {
+                // write_rules also writes the seen rule; the fixture's
+                // deny.yaml is simply not loaded.
+                write_rules(&rules_dir);
+                let custom = rules_dir.join("custom.yaml");
+                std::fs::write(&custom, rules_yaml).expect("failed to write custom rules");
+                vec![custom, rules_dir.join("seen.yaml")]
+            }
         };
 
         // Write Falco config.
@@ -246,9 +272,21 @@ impl E2eHarness {
 
     /// Build a Claude Code hook JSON input string (PreToolUse).
     pub fn make_input(tool_name: &str, tool_input: &str, cwd: &str, tool_use_id: &str) -> String {
+        Self::make_session_input("e2e-test", tool_name, tool_input, cwd, tool_use_id)
+    }
+
+    /// Build a Claude Code hook JSON input string (PreToolUse) for a given
+    /// session, for tests that depend on per-session state.
+    pub fn make_session_input(
+        session_id: &str,
+        tool_name: &str,
+        tool_input: &str,
+        cwd: &str,
+        tool_use_id: &str,
+    ) -> String {
         format!(
-            r#"{{"hook_event_name":"PreToolUse","tool_name":"{}","tool_input":{},"session_id":"e2e-test","cwd":"{}","tool_use_id":"{}"}}"#,
-            tool_name, tool_input, cwd, tool_use_id
+            r#"{{"hook_event_name":"PreToolUse","tool_name":"{}","tool_input":{},"session_id":"{}","cwd":"{}","tool_use_id":"{}"}}"#,
+            tool_name, tool_input, session_id, cwd, tool_use_id
         )
     }
 
@@ -354,6 +392,8 @@ append_output:
   - match:
       source: coding_agent
     extra_output: "| correlation=%correlation.id"
+    extra_fields:
+      - agent.session_id
 # Mirror production: hot-reload is disabled. ctl drives all config changes
 # via stop -> rewrite -> start. See configs/falco.yaml for the rationale.
 watch_config_files: false

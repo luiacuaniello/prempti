@@ -67,7 +67,7 @@ test-codex-interceptor: build-codex-interceptor
 
 ## Run end-to-end tests (Rust, cross-platform, requires Falco built)
 test-e2e: build
-	cd tests && cargo test --test e2e --test e2e_monitor --test e2e_concurrent -- --nocapture
+	cd tests && cargo test --test e2e --test e2e_monitor --test e2e_concurrent --test e2e_session_marks -- --nocapture
 
 ## Run Codex Falco-driven E2E tests (requires Falco + plugin + codex-interceptor built)
 test-codex-e2e: build-codex-interceptor build-plugin
