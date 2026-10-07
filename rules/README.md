@@ -43,6 +43,7 @@ Rules use tags to communicate verdicts to the plugin broker:
 | `coding_agent_deny` | Block the tool call |
 | `coding_agent_ask` | Require user confirmation |
 | `coding_agent_seen` | Signal evaluation complete (used only by `seen.yaml`) |
+| `coding_agent_mark:<label>` | Record `<label>` in the event's session; no verdict on its own (see [Session marks](#session-marks)) |
 
 When multiple rules match the same event, verdict escalation applies: **deny > ask > {allow | defer}**. The lowest tier is the no-rule-match floor set by the plugin's `default_action` (`allow` by default, or `defer` to hand the decision to the agent's own permission system); a single instance uses one floor uniformly.
 
@@ -114,6 +115,39 @@ A custom user rule that asks for confirmation before the agent edits a dependenc
   source: coding_agent
   tags: [coding_agent_ask]
 ```
+
+### Session marks
+
+Each rule sees a single event, but some behaviors only become suspicious as a sequence — an attempt to read secrets followed by a web request, for instance. The default ruleset already denies the read (`Deny reading sensitive paths`), but no single-event rule can make what follows it stricter, and the attempt itself reveals intent. A rule tagged `coding_agent_mark:<label>` records `<label>` in the session of the event it matched, whatever that event's verdict; later events of the same session can query it:
+
+| Field | Value |
+|-------|-------|
+| `session.mark_age_ms[<label>]` | Milliseconds since `<label>` was last marked by an earlier tool call of this session; no value (comparisons are false) if never marked |
+| `session.mark_count[<label>]` | Number of earlier tool calls of this session that marked `<label>`; `0` if never marked |
+
+```yaml
+- rule: Mark sensitive read attempt
+  desc: Record that the session tried to read a sensitive file. The default ruleset already denies the read; the attempt itself is the signal.
+  condition: tool.name = "Read" and is_sensitive_path
+  output: Falco noted that this session tried to read %tool.real_file_path
+  priority: INFORMATIONAL
+  source: coding_agent
+  tags: [coding_agent_mark:sensitive_read]
+
+- rule: Ask before web requests after a sensitive read attempt
+  desc: Require confirmation for web requests within 5 minutes of an attempt to read a sensitive file in the same session.
+  condition: tool.name = "WebFetch" and session.mark_age_ms[sensitive_read] < 300000
+  output: >
+    Falco requires confirmation for this web request because this session tried
+    to read a sensitive file %session.mark_age_ms[sensitive_read] ms ago
+  priority: WARNING
+  source: coding_agent
+  tags: [coding_agent_ask]
+```
+
+The mark rule reuses the default ruleset's `is_sensitive_path` macro, so it matches the reads that `Deny reading sensitive paths` denies: the read is still denied, and the session is marked.
+
+A mark is visible to the session's *later* tool calls, never to the tool call that set it, and a tool call counts once per label however many of its rules mark it. Marks are kept in memory only and reset when the service restarts. Use marks to escalate verdicts (ask, deny), never to exempt events from other rules: like verdict alerts, marks arrive over the unauthenticated loopback receiver.
 
 ### Tips
 
